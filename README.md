@@ -84,7 +84,7 @@ Optional CoreML semantic encoder (downloaded automatically when `--coreml-semant
 |-----------|------|
 | [gafiatulin/vibevoice-semantic-encoder-mlpackage](https://huggingface.co/gafiatulin/vibevoice-semantic-encoder-mlpackage) | ~657 MB |
 
-The semantic encoder provides acoustic feedback to the LLM during generation, improving speech quality. By default it runs as a pure MLX model on the GPU. The CoreML variant offloads it to the Apple Neural Engine, freeing the GPU for the LLM and diffusion head — this improves throughput without quality loss.
+The semantic encoder provides acoustic feedback to the LLM during generation, improving speech quality. By default it runs as a pure MLX model on the GPU. The optional CoreML path uses explicit convolution-cache tensors so feedback preserves history. `--coreml-semantic` selects CPU/GPU execution; `--ane-semantic` selects CPU/Neural Engine execution. ANE speed and numerical precision vary by device, so benchmark and listen before choosing it. Predictions remain synchronous because the next LLM step depends on the semantic feedback.
 
 ## Architecture
 
@@ -114,7 +114,8 @@ Text ──→ Qwen2.5 LLM backbone ──→ control tokens
 --max-speech-tokens N    Max speech tokens to generate (default: 200)
 --seed INT               Random seed (default: 42)
 --no-semantic            Disable semantic encoder feedback
---coreml-semantic        Use CoreML semantic encoder for GPU pipelining
+--coreml-semantic        Use CoreML CPU/GPU semantic encoder
+--ane-semantic           Use CoreML CPU/Neural Engine semantic encoder (opt-in)
 --tokenizer MODEL        Override tokenizer (default: bundled)
 ```
 
@@ -123,7 +124,7 @@ Text ──→ Qwen2.5 LLM backbone ──→ control tokens
 - **DPM-Solver++ 2M**: Second-order multistep solver — 10 DPM steps > 100 DDPM steps quality
 - **Streaming VAE decoder**: Causal conv caches for chunk-by-chunk decoding
 - **Streaming semantic encoder**: 34-buffer causal CNN for real-time feedback
-- **CoreML semantic pipelining**: Offload semantic encoder to ANE while GPU runs LLM
+- **CoreML semantic encoder**: Explicit recurrent caches with CPU/GPU or opt-in CPU/Neural Engine execution
 - **Selective quantization**: LLM backbone quantized (int4/int8), diffusion head stays full precision
 - **MLX-native RNG**: Uses MLX's Threefry Mersenne-Prime generator for fast, on-device noise sampling
 - **bf16→fp16 conversion**: 2x faster inference on Apple Silicon vs bfloat16
@@ -159,3 +160,28 @@ uv sync
 This inference code is MIT licensed. See [LICENSE](LICENSE).
 
 The model weights ([microsoft/VibeVoice-1.5B](https://huggingface.co/microsoft/VibeVoice-1.5B)) are under the [MIT License](https://huggingface.co/microsoft/VibeVoice-1.5B/blob/main/LICENSE).
+
+## Reproducible five-minute benchmark
+
+Install the optional backend with `uv sync --frozen --extra coreml`. Run each backend
+in a separate process, with the same local model and voice references:
+
+```bash
+uv run --frozen --extra coreml python benchmarks/podcast.py \
+  --model /path/to/vibevoice-7b-mlx \
+  --text-file benchmarks/podcast.txt \
+  --ref-audio /path/to/Alice.wav /path/to/Frank.wav \
+  --backend mlx --output /path/to/baseline.wav
+
+# Repeat with --backend ane and a different output path.
+# --backend coreml measures the corrected CoreML CPU/GPU path.
+```
+
+The benchmark uses INT8 LLM weights, 10 ODE steps, guidance 1.3, seed 42, a separate
+eight-frame warm-up, and a 2,250-frame budget (exactly 300 seconds). The supplied
+text is deliberately longer than the budget, so the WAV is a timed excerpt. It
+records setup, warm-up, synchronized generation time, MLX peak memory, process RSS,
+input hashes, and audio checks in JSON beside the WAV. It fails if a backend does
+not load or generation ends before the frame budget. Model loading and audio-file
+writing are excluded from generation time. CoreML allocations are not included in
+MLX's memory counter, and process RSS is a separate metric, not an additive total.

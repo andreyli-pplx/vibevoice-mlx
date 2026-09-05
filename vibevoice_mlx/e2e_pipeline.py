@@ -15,6 +15,7 @@ import math
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,9 @@ import mlx.core as mx
 
 from .generate import GenerationOptions, generate
 from .load_weights import load_model, resolve_model_path
+from .model import VibeVoiceConfig, VibeVoiceModel
+
+SemanticCallbacks = tuple[Callable[[np.ndarray], np.ndarray], Callable[[], None]]
 
 logger = logging.getLogger(__name__)
 
@@ -284,16 +288,20 @@ def tokenize_text(
     return system_tokens + text_section + speaker_tokens + output_section + [config.speech_start_id]
 
 
-def _load_semantic_encoder(model, config, model_id, use_coreml=False):
+def _load_semantic_encoder(
+    model: VibeVoiceModel, config: VibeVoiceConfig, model_id: str,
+    use_coreml: bool = False, use_ane: bool = False,
+) -> SemanticCallbacks | None:
     """Load semantic encoder + connector, returns (callback, reset_fn) or (None, None).
 
     Args:
-        use_coreml: If True, try CoreML semantic encoder (faster, requires
-            coremltools and downloads ~657MB .mlpackage on first use).
-            If False (default), use pure MLX.
+        use_coreml: Try CoreML CPU/GPU execution (requires the coreml extra).
+        use_ane: Try CoreML CPU/Neural Engine execution; takes priority over
+            use_coreml. Both paths download and adapt the legacy package once.
+            With neither option, use pure MLX.
     """
-    if use_coreml:
-        result = _try_coreml_semantic(model, config)
+    if use_coreml or use_ane:
+        result = _try_coreml_semantic(model, config, use_ane=use_ane)
         if result is not None:
             return result
 
@@ -301,8 +309,10 @@ def _load_semantic_encoder(model, config, model_id, use_coreml=False):
     return _try_mlx_semantic(model, config, model_id)
 
 
-def _try_coreml_semantic(model, config):
-    """Try loading CoreML semantic encoder (.mlpackage with stateful conv caches).
+def _try_coreml_semantic(
+    model: VibeVoiceModel, config: VibeVoiceConfig, use_ane: bool = False,
+) -> SemanticCallbacks | None:
+    """Load the legacy CoreML encoder with corrected explicit convolution caches.
 
     Search order:
     1. Local vibevoice-coreml build dir (development)
@@ -351,40 +361,36 @@ def _try_coreml_semantic(model, config):
         return None
 
     try:
-        sem_enc = ct.models.MLModel(
-            str(sem_enc_path),
-            compute_units=ct.ComputeUnit.CPU_AND_GPU,
-        )
-        sem_state = sem_enc.make_state()
+        from .coreml_semantic import ExplicitCacheEncoder, prepare_explicit_cache_model
 
-        # Verify
-        sem_enc.predict(
-            {"audio": np.zeros((1, 1, 3200), dtype=np.float32)},
-            state=sem_state,
+        explicit_path = prepare_explicit_cache_model(
+            sem_enc_path, Path.home() / ".cache" / "vibevoice-mlx" / "coreml"
         )
-        sem_state = sem_enc.make_state()  # reset after test
+        units = ct.ComputeUnit.CPU_AND_NE if use_ane else ct.ComputeUnit.CPU_AND_GPU
+        sem_enc = ExplicitCacheEncoder(ct.models.MLModel(str(explicit_path), compute_units=units))
+
+        # Verify the requested device can execute, then clear the warm-up history.
+        sem_enc(np.zeros((1, 1, 3200), dtype=np.float32))
+        sem_enc.reset()
 
         # Use MLX semantic connector (correct hidden_size for both 1.5B and 7B)
-        def semantic_fn(audio_chunk):
+        def semantic_fn(audio_chunk: np.ndarray) -> np.ndarray:
             audio_input = np.zeros((1, 1, 3200), dtype=np.float32)
             audio_input[0, 0, :min(len(audio_chunk), 3200)] = audio_chunk[:3200]
-            features = sem_enc.predict(
-                {"audio": audio_input}, state=sem_state
-            )["features"]
+            features = sem_enc(audio_input)
             # features: (1, 128, 1) -> (1, 1, 128) for MLX connector
             feat = mx.array(features.transpose(0, 2, 1)).astype(mx.float16)
             embedding = model.semantic_connector(feat)
             mx.eval(embedding)
             return np.array(embedding)
 
-        def reset_fn():
-            nonlocal sem_state
-            sem_state = sem_enc.make_state()
+        def reset_fn() -> None:
+            sem_enc.reset()
 
-        logger.info("Semantic encoder: CoreML + MLX connector")
+        logger.info("Semantic encoder: CoreML %s + MLX connector", units.name)
         return semantic_fn, reset_fn
     except Exception as e:
-        logger.debug("  CoreML semantic encoder failed: %s", e)
+        logger.warning("CoreML semantic encoder unavailable: %s", e)
         return None
 
 
@@ -412,7 +418,7 @@ def _try_mlx_semantic(model, config, model_id):
         mx.eval(test_out)
         sem_enc.reset_caches()
 
-        def semantic_fn(audio_chunk):
+        def semantic_fn(audio_chunk: np.ndarray) -> np.ndarray:
             audio_np = np.zeros((1, 1, FRAME_SAMPLES), dtype=np.float32)
             audio_np[0, 0, :min(len(audio_chunk), FRAME_SAMPLES)] = audio_chunk[:FRAME_SAMPLES]
             features = sem_enc(mx.array(audio_np))
@@ -422,7 +428,7 @@ def _try_mlx_semantic(model, config, model_id):
             mx.eval(embedding)
             return np.array(embedding)
 
-        def reset_fn():
+        def reset_fn() -> None:
             sem_enc.reset_caches()
 
         logger.info("Semantic encoder: MLX (%d cache buffers)", len(sem_enc.caches))
@@ -481,7 +487,9 @@ def main():
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic feedback (faster, lower quality)")
     parser.add_argument("--coreml-semantic", action="store_true",
-                        help="Use CoreML semantic encoder (faster, downloads ~657MB on first use)")
+                        help="Use CoreML CPU/GPU semantic encoder (downloads ~657MB on first use)")
+    parser.add_argument("--ane-semantic", action="store_true",
+                        help="Use CoreML CPU + Neural Engine semantic encoder (opt-in; benchmark on your device)")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Tokenizer name (auto-detected if not specified)")
     args = parser.parse_args()
@@ -578,7 +586,7 @@ def main():
     semantic_reset = None
     if not args.no_semantic:
         result = _load_semantic_encoder(model, config, args.model,
-                                         use_coreml=args.coreml_semantic)
+                                         use_coreml=args.coreml_semantic, use_ane=args.ane_semantic)
         if result is not None:
             semantic_fn, semantic_reset = result
         else:
