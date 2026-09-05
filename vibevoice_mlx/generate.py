@@ -371,9 +371,13 @@ def generate(
     mx.eval(logits)
     next_token = int(mx.argmax(logits[0, 0]).item())
 
-    # Always batch-decode at end for clean audio.
-    # For semantic feedback, use cheap non-streaming per-token VAE
-    # (quality doesn't matter — just needs approximate audio for features).
+    # Semantic feedback must hear the same continuous audio we return. Keep
+    # causal decoder history for this invocation, including across speech_end
+    # boundaries, just as a batch decode of all generated latents would.
+    streaming_decoder = (
+        StreamingVAEDecoder(model.vae_decoder)
+        if semantic_encoder_fn is not None else None
+    )
 
     # Autoregressive generation
     audio_chunks = []
@@ -418,16 +422,16 @@ def generate(
             )
             metrics.record("diffusion", (time.perf_counter() - t0) * 1000)
 
-            # Scale and accumulate latent for batch re-decode
+            # Keep latents for silence detection and the no-semantic batch path.
             latent = (sample / config.speech_scaling_factor - config.speech_bias_factor)
             all_latents.append(latent)
 
-            # Per-token VAE for semantic feedback (diffusion already eval'd, so this is cheap)
-            if semantic_encoder_fn is not None:
+            # Decode once with causal history, then reuse for feedback and output.
+            if streaming_decoder is not None:
                 t0 = time.perf_counter()
                 latent_frame = latent[:, :, None].astype(dtype)
-                audio = model.vae_decoder(latent_frame)
-                mx.eval(audio)
+                audio = streaming_decoder(latent_frame)
+                mx.eval(audio, *streaming_decoder.caches.values())
                 audio_chunks.append(np.array(audio).squeeze().astype(np.float32))
                 metrics.record("vae", (time.perf_counter() - t0) * 1000)
 
@@ -495,13 +499,16 @@ def generate(
     # Close progress bar
     pbar.close()
 
-    # Batch re-decode all latents for temporally continuous audio
+    # Reuse continuous feedback audio; batch-decode only without semantic feedback.
     if all_latents:
         t0 = time.perf_counter()
-        full_latent = mx.concatenate(all_latents, axis=0).T[None, :, :].astype(dtype)
-        full_audio = model.vae_decoder(full_latent)
-        mx.eval(full_audio)
-        audio_out = np.array(full_audio).squeeze().astype(np.float32)
+        if streaming_decoder is not None:
+            audio_out = np.concatenate(audio_chunks)
+        else:
+            full_latent = mx.concatenate(all_latents, axis=0).T[None, :, :].astype(dtype)
+            full_audio = model.vae_decoder(full_latent)
+            mx.eval(full_audio)
+            audio_out = np.array(full_audio).squeeze().astype(np.float32)
         do_trim = opts.trim_trailing_silence if opts.trim_trailing_silence is not None else opts.silence_detection
         if do_trim:
             audio_out = _trim_trailing_silence(
